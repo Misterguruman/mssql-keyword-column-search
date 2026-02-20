@@ -8,6 +8,7 @@ which columns contain which keywords.
 import argparse
 import csv
 import os
+import re
 import sys
 
 
@@ -124,6 +125,58 @@ def load_keywords(filepath):
     return keywords
 
 
+_REGEX_BACKSLASH_SEQUENCES = re.compile(r"\\[dDwWsSbB]")
+_REGEX_CHAR_CLASS = re.compile(r"\[.*?\]")
+_REGEX_QUANTIFIER_BRACE = re.compile(r"\{\d+(?:,\d*)?\}")
+
+
+def _looks_like_regex(keyword):
+    """Check if a keyword contains conservative regex-specific syntax.
+
+    Args:
+        keyword: The raw keyword string.
+
+    Returns:
+        True if the keyword appears to contain regex syntax.
+    """
+    if _REGEX_BACKSLASH_SEQUENCES.search(keyword):
+        return True
+    if _REGEX_CHAR_CLASS.search(keyword):
+        return True
+    if _REGEX_QUANTIFIER_BRACE.search(keyword):
+        return True
+    if keyword.startswith("^") or keyword.endswith("$"):
+        return True
+    return False
+
+
+def classify_keywords(keywords):
+    """Classify keywords as plain literals or regex patterns.
+
+    Scans each keyword for conservative regex indicators. If detected,
+    validates with re.compile(). Falls back to literal if compilation fails.
+
+    Args:
+        keywords: List of keyword strings.
+
+    Returns:
+        List of (keyword_text, is_regex) tuples.
+    """
+    classified = []
+    for kw in keywords:
+        if _looks_like_regex(kw):
+            try:
+                re.compile(kw)
+                classified.append((kw, True))
+            except re.error:
+                print(f"  Warning: '{kw}' looks like regex but failed to compile"
+                      " - treating as literal")
+                classified.append((kw, False))
+        else:
+            classified.append((kw, False))
+    return classified
+
+
 def escape_like_pattern(keyword, escape_char="\\"):
     """Escape special SQL LIKE pattern characters in a keyword.
 
@@ -184,6 +237,71 @@ def connect_to_database(connection_string):
     return pyodbc.connect(connection_string, timeout=30)
 
 
+_KNOWN_REGEX_FUNCTIONS = [
+    "RegexMatch",
+    "RegExIsMatch",
+    "fn_RegexMatch",
+    "fn_RegExIsMatch",
+]
+
+
+def discover_regex_function(cursor):
+    """Check if a usable CLR regex function exists on the server.
+
+    Queries sys.objects for known regex function names, then verifies
+    the signature has at least two string parameters and returns BIT.
+
+    Args:
+        cursor: pyodbc cursor.
+
+    Returns:
+        Schema-qualified function name (e.g. 'dbo.RegexMatch') or None.
+    """
+    placeholders = ",".join("?" for _ in _KNOWN_REGEX_FUNCTIONS)
+    lower_names = [name.lower() for name in _KNOWN_REGEX_FUNCTIONS]
+
+    # Find scalar functions matching known names (case-insensitive)
+    cursor.execute(
+        "SELECT s.name AS schema_name, o.name AS func_name, o.object_id "
+        "FROM sys.objects o "
+        "JOIN sys.schemas s ON o.schema_id = s.schema_id "
+        "WHERE o.type IN ('FS', 'FN') "
+        f"AND LOWER(o.name) IN ({placeholders})",
+        lower_names,
+    )
+    candidates = cursor.fetchall()
+
+    for schema_name, func_name, object_id in candidates:
+        # Verify signature: at least 2 string params, returns bit
+        cursor.execute(
+            "SELECT p.name, t.name AS type_name, p.is_output "
+            "FROM sys.parameters p "
+            "JOIN sys.types t ON p.user_type_id = t.user_type_id "
+            "WHERE p.object_id = ? "
+            "ORDER BY p.parameter_id",
+            (object_id,),
+        )
+        params = cursor.fetchall()
+
+        # parameter_id 0 is the return value, rest are inputs
+        return_params = [p for p in params if p[0] == "" or p[2] == True]
+        input_params = [p for p in params if p[0] != "" and p[2] == False]
+
+        # Check: return type is bit, at least 2 string input params
+        string_types = {"nvarchar", "varchar", "nchar", "char", "ntext", "text"}
+        has_bit_return = any(
+            p[1].lower() == "bit" for p in params if p[0] == ""
+        )
+        string_inputs = [
+            p for p in input_params if p[1].lower() in string_types
+        ]
+
+        if has_bit_return and len(string_inputs) >= 2:
+            return f"{schema_name}.{func_name}"
+
+    return None
+
+
 def get_table_columns(cursor, table):
     """Discover column names for a table via INFORMATION_SCHEMA.
 
@@ -238,17 +356,20 @@ def _quote_identifier(name):
     return ".".join(quoted)
 
 
-def search_database(cursor, table, columns, keywords):
+def search_database(cursor, table, columns, classified_keywords,
+                    regex_fn=None):
     """Search database columns for keyword matches.
 
-    Creates a temp table of keywords, then checks each column for matches
-    using LIKE with case-insensitive collation.
+    Plain keywords use a temp table + LIKE approach. Regex keywords use
+    a CLR function server-side if available, otherwise fall back to
+    pulling distinct values and matching client-side with re.search().
 
     Args:
         cursor: pyodbc cursor.
         table: Table name (optionally schema-qualified).
         columns: List of column names to search.
-        keywords: List of keyword strings.
+        classified_keywords: List of (keyword_text, is_regex) tuples.
+        regex_fn: Schema-qualified CLR regex function name, or None.
 
     Returns:
         List of (column_name, keyword) tuples for each match found.
@@ -256,61 +377,98 @@ def search_database(cursor, table, columns, keywords):
     results = []
     quoted_table = _quote_identifier(table)
 
-    # Step 1: Create temp table
-    cursor.execute(
-        "CREATE TABLE #Keywords ("
-        "keyword NVARCHAR(500), "
-        "pattern NVARCHAR(510)"
-        ")"
-    )
+    plain_keywords = [kw for kw, is_re in classified_keywords if not is_re]
+    regex_keywords = [kw for kw, is_re in classified_keywords if is_re]
 
-    # Step 2: Batch-insert keywords
-    rows = [(kw, escape_like_pattern(kw)) for kw in keywords]
-    batch_size = 500
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
-        cursor.executemany(
-            "INSERT INTO #Keywords (keyword, pattern) VALUES (?, ?)",
-            batch,
+    # --- Plain keyword search via temp table + LIKE ---
+    if plain_keywords:
+        cursor.execute(
+            "CREATE TABLE #Keywords ("
+            "keyword NVARCHAR(500), "
+            "pattern NVARCHAR(510)"
+            ")"
         )
 
-    # Step 3: Search each column
+        rows = [(kw, escape_like_pattern(kw)) for kw in plain_keywords]
+        batch_size = 500
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            cursor.executemany(
+                "INSERT INTO #Keywords (keyword, pattern) VALUES (?, ?)",
+                batch,
+            )
+
     try:
         for idx, col in enumerate(columns, 1):
             quoted_col = _quote_identifier(col)
             print(f"  Searching column {idx}/{len(columns)}: {col}")
 
-            query = (
-                "SELECT DISTINCT k.keyword FROM #Keywords k "
-                "WHERE EXISTS ("
-                f"SELECT 1 FROM {quoted_table} "
-                f"WHERE CAST({quoted_col} AS NVARCHAR(MAX)) "
-                "COLLATE Latin1_General_CI_AS "
-                "LIKE N'%' + k.pattern + N'%' "
-                "COLLATE Latin1_General_CI_AS "
-                "ESCAPE N'\\'"
-                ")"
-            )
-            cursor.execute(query)
-            for row in cursor.fetchall():
-                results.append((col, row[0]))
+            # Plain keywords via LIKE
+            if plain_keywords:
+                query = (
+                    "SELECT DISTINCT k.keyword FROM #Keywords k "
+                    "WHERE EXISTS ("
+                    f"SELECT 1 FROM {quoted_table} "
+                    f"WHERE CAST({quoted_col} AS NVARCHAR(MAX)) "
+                    "COLLATE Latin1_General_CI_AS "
+                    "LIKE N'%' + k.pattern + N'%' "
+                    "COLLATE Latin1_General_CI_AS "
+                    "ESCAPE N'\\'"
+                    ")"
+                )
+                cursor.execute(query)
+                for row in cursor.fetchall():
+                    results.append((col, row[0]))
+
+            # Regex keywords
+            if regex_keywords and regex_fn:
+                # Server-side CLR path
+                quoted_fn = _quote_identifier(regex_fn)
+                for pattern in regex_keywords:
+                    query = (
+                        f"SELECT 1 WHERE EXISTS ("
+                        f"SELECT 1 FROM {quoted_table} "
+                        f"WHERE {quoted_fn}("
+                        f"CAST({quoted_col} AS NVARCHAR(MAX)), ?"
+                        ") = 1)"
+                    )
+                    cursor.execute(query, (pattern,))
+                    if cursor.fetchone():
+                        results.append((col, pattern))
+
+            elif regex_keywords:
+                # Client-side fallback: pull distinct values once per column
+                query = (
+                    f"SELECT DISTINCT CAST({quoted_col} AS NVARCHAR(MAX)) "
+                    f"FROM {quoted_table} "
+                    f"WHERE {quoted_col} IS NOT NULL"
+                )
+                cursor.execute(query)
+                col_values = [row[0] for row in cursor.fetchall()]
+
+                for pattern in regex_keywords:
+                    compiled = re.compile(pattern, re.IGNORECASE)
+                    for val in col_values:
+                        if compiled.search(val):
+                            results.append((col, pattern))
+                            break
     finally:
-        # Step 4: Cleanup
-        cursor.execute("DROP TABLE IF EXISTS #Keywords")
+        if plain_keywords:
+            cursor.execute("DROP TABLE IF EXISTS #Keywords")
 
     return results
 
 
-def search_csv(csv_path, keywords):
+def search_csv(csv_path, classified_keywords):
     """Search CSV file columns for keyword matches.
 
-    For each (column, keyword) pair, checks if any cell contains
-    the keyword as a case-insensitive substring. Short-circuits
-    on first match per pair.
+    Plain keywords use case-insensitive substring matching.
+    Regex keywords use re.search() with IGNORECASE.
+    Short-circuits on first match per (column, keyword) pair.
 
     Args:
         csv_path: Path to the CSV file.
-        keywords: List of keyword strings.
+        classified_keywords: List of (keyword_text, is_regex) tuples.
 
     Returns:
         List of (column_name, keyword) tuples for each match found.
@@ -325,17 +483,37 @@ def search_csv(csv_path, keywords):
         columns = list(reader.fieldnames)
         rows = list(reader)
 
-    lower_keywords = [(kw, kw.lower()) for kw in keywords]
+    # Pre-process keywords: plain get lowercased, regex get compiled
+    prepared = []
+    for kw, is_regex in classified_keywords:
+        if is_regex:
+            try:
+                compiled = re.compile(kw, re.IGNORECASE)
+                prepared.append((kw, True, compiled))
+            except re.error:
+                # Defensive: should not happen since classify_keywords validated
+                print(f"  Warning: skipping invalid regex pattern: {kw}")
+                continue
+        else:
+            prepared.append((kw, False, kw.lower()))
+
     total = len(columns)
 
     for idx, col in enumerate(columns, 1):
         print(f"  Searching column {idx}/{total}: {col}")
-        for kw, kw_lower in lower_keywords:
+        for kw, is_regex, matcher in prepared:
             for row in rows:
                 cell = row.get(col, "")
-                if cell is not None and kw_lower in cell.lower():
-                    results.append((col, kw))
-                    break
+                if cell is None:
+                    continue
+                if is_regex:
+                    if matcher.search(cell):
+                        results.append((col, kw))
+                        break
+                else:
+                    if matcher in cell.lower():
+                        results.append((col, kw))
+                        break
 
     return results
 
@@ -368,18 +546,25 @@ def main(argv=None):
     except SystemExit as e:
         return e.code if e.code is not None else 1
 
-    # Load keywords
+    # Load and classify keywords
     keywords = load_keywords(args.keywords)
     if not keywords:
         print("Error: keyword file is empty or contains only blank lines.")
         return 1
-    print(f"Loaded {len(keywords)} keyword(s).")
+
+    classified = classify_keywords(keywords)
+    num_literal = sum(1 for _, is_re in classified if not is_re)
+    num_regex = sum(1 for _, is_re in classified if is_re)
+    print(f"Loaded {len(classified)} keyword(s): {num_literal} literal, {num_regex} regex")
+    for kw, is_re in classified:
+        if is_re:
+            print(f"  Regex: {kw}")
 
     try:
         if args.csv_path:
             # CSV mode
             print(f"Searching CSV file: {args.csv_path}")
-            results = search_csv(args.csv_path, keywords)
+            results = search_csv(args.csv_path, classified)
         else:
             # Database mode
             conn_str = build_connection_string(args)
@@ -388,12 +573,27 @@ def main(argv=None):
             print("Connected.")
             try:
                 cursor = conn.cursor()
+
+                # Discover CLR regex function if we have regex keywords
+                regex_fn = None
+                if num_regex > 0:
+                    print("Checking for server-side regex function...")
+                    regex_fn = discover_regex_function(cursor)
+                    if regex_fn:
+                        print(f"Found server-side regex function: {regex_fn}")
+                    else:
+                        print("No server-side regex function found; "
+                              "regex patterns will use client-side matching")
+
                 print(f"Discovering columns for table: {args.table}")
                 columns = get_table_columns(cursor, args.table)
                 print(f"Found {len(columns)} column(s).")
 
                 print("Searching for keywords...")
-                results = search_database(cursor, args.table, columns, keywords)
+                results = search_database(
+                    cursor, args.table, columns, classified,
+                    regex_fn=regex_fn,
+                )
             finally:
                 conn.close()
                 print("Connection closed.")
