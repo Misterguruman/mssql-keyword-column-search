@@ -64,12 +64,25 @@ python keyword_search.py -s SERVER -d DATABASE -t TABLE -a AUTH_TYPE -k keywords
 
 Plain text file with one keyword per line. Blank lines are ignored. Duplicate keywords (case-insensitive) are removed. UTF-8 with or without BOM is supported.
 
+Lines containing regex-specific syntax are automatically detected and treated as regex patterns. The following indicators trigger regex detection:
+
+- Backslash sequences: `\d`, `\w`, `\s`, `\b` (and uppercase variants)
+- Character classes: `[a-z]`, `[0-9A-F]`, etc.
+- Quantifier braces: `{3}`, `{2,4}`, etc.
+- Anchors: `^` at start or `$` at end
+
+All other lines are treated as plain substring keywords. If a line looks like regex but fails to compile, it falls back to a plain keyword with a warning.
+
 ```
 Confidential
 SSN
 Social Security
 credit card
+\d{3}-\d{2}-\d{4}
+[A-Z]{2}\d{6}
 ```
+
+In database mode, regex patterns are matched using a server-side CLR regex function if one is found (e.g., `dbo.RegexMatch`). If no CLR function is available, the tool pulls distinct column values and matches client-side with Python's `re` module. In CSV mode, regex patterns use Python's `re.search()` directly.
 
 ## Output
 
