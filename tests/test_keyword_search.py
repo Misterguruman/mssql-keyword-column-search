@@ -2,6 +2,7 @@
 
 import csv
 import os
+import re
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -183,6 +184,86 @@ class TestLoadKeywords:
         assert result == ["apple", "banana"]
 
 
+# ---------- classify_keywords ----------
+
+class TestClassifyKeywords:
+
+    def test_plain_keywords(self):
+        result = keyword_search.classify_keywords(["hello", "SSN", "Confidential"])
+        assert result == [("hello", False), ("SSN", False), ("Confidential", False)]
+
+    def test_backslash_d(self):
+        result = keyword_search.classify_keywords([r"\d{3}-\d{2}-\d{4}"])
+        assert result == [(r"\d{3}-\d{2}-\d{4}", True)]
+
+    def test_backslash_w(self):
+        result = keyword_search.classify_keywords([r"\w+@\w+"])
+        assert result == [(r"\w+@\w+", True)]
+
+    def test_backslash_s(self):
+        result = keyword_search.classify_keywords([r"hello\sworld"])
+        assert result == [(r"hello\sworld", True)]
+
+    def test_backslash_b(self):
+        result = keyword_search.classify_keywords([r"\bword\b"])
+        assert result == [(r"\bword\b", True)]
+
+    def test_uppercase_variants(self):
+        for seq in [r"\D+", r"\W+", r"\S+", r"\B"]:
+            result = keyword_search.classify_keywords([seq])
+            assert result[0][1] is True, f"{seq} should be detected as regex"
+
+    def test_character_class(self):
+        result = keyword_search.classify_keywords(["[a-zA-Z]"])
+        assert result == [("[a-zA-Z]", True)]
+
+    def test_quantifier_braces(self):
+        result = keyword_search.classify_keywords([r"x{3}"])
+        assert result == [(r"x{3}", True)]
+
+    def test_quantifier_brace_range(self):
+        result = keyword_search.classify_keywords([r"x{2,4}"])
+        assert result == [(r"x{2,4}", True)]
+
+    def test_anchor_caret(self):
+        result = keyword_search.classify_keywords(["^Start"])
+        assert result == [("^Start", True)]
+
+    def test_anchor_dollar(self):
+        result = keyword_search.classify_keywords(["end$"])
+        assert result == [("end$", True)]
+
+    def test_plain_percent_no_false_positive(self):
+        result = keyword_search.classify_keywords(["100%"])
+        assert result == [("100%", False)]
+
+    def test_plain_cpp_no_false_positive(self):
+        result = keyword_search.classify_keywords(["C++"])
+        assert result == [("C++", False)]
+
+    def test_plain_mr_smith_no_false_positive(self):
+        result = keyword_search.classify_keywords(["Mr. Smith"])
+        assert result == [("Mr. Smith", False)]
+
+    def test_invalid_regex_falls_back_to_literal(self, capsys):
+        # \d triggers detection, unclosed paren makes it invalid regex
+        result = keyword_search.classify_keywords([r"\d("])
+        assert result == [(r"\d(", False)]
+        captured = capsys.readouterr()
+        assert "Warning" in captured.out
+        assert "treating as literal" in captured.out
+
+    def test_mixed_keywords(self):
+        keywords = ["Confidential", r"\d{3}-\d{2}-\d{4}", "SSN", "[A-Z]{2}"]
+        result = keyword_search.classify_keywords(keywords)
+        assert result == [
+            ("Confidential", False),
+            (r"\d{3}-\d{2}-\d{4}", True),
+            ("SSN", False),
+            ("[A-Z]{2}", True),
+        ]
+
+
 # ---------- build_connection_string ----------
 
 class TestBuildConnectionString:
@@ -302,6 +383,85 @@ class TestQuoteIdentifier:
         assert keyword_search._quote_identifier("my].schema.my]table") == "[my]]].[schema.my]]table]"
 
 
+# ---------- discover_regex_function ----------
+
+class TestDiscoverRegexFunction:
+
+    def test_finds_known_function(self):
+        cursor = MagicMock()
+        # First call: find candidates
+        cursor.fetchall.side_effect = [
+            [("dbo", "RegexMatch", 12345)],  # candidates
+            [
+                ("", "bit", True),           # return param
+                ("@input", "nvarchar", False),  # input 1
+                ("@pattern", "nvarchar", False),  # input 2
+            ],
+        ]
+
+        result = keyword_search.discover_regex_function(cursor)
+        assert result == "dbo.RegexMatch"
+
+    def test_no_candidates(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+
+        result = keyword_search.discover_regex_function(cursor)
+        assert result is None
+
+    def test_rejects_wrong_signature_no_bit_return(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("dbo", "RegexMatch", 12345)],
+            [
+                ("", "int", True),              # wrong return type
+                ("@input", "nvarchar", False),
+                ("@pattern", "nvarchar", False),
+            ],
+        ]
+
+        result = keyword_search.discover_regex_function(cursor)
+        assert result is None
+
+    def test_rejects_wrong_signature_too_few_string_params(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("dbo", "RegexMatch", 12345)],
+            [
+                ("", "bit", True),
+                ("@input", "nvarchar", False),
+                ("@flags", "int", False),       # not a string param
+            ],
+        ]
+
+        result = keyword_search.discover_regex_function(cursor)
+        assert result is None
+
+    def test_picks_first_valid_from_multiple_candidates(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [
+                ("dbo", "RegexMatch", 111),
+                ("util", "fn_RegexMatch", 222),
+            ],
+            # First candidate: wrong signature
+            [
+                ("", "int", True),
+                ("@input", "nvarchar", False),
+                ("@pattern", "nvarchar", False),
+            ],
+            # Second candidate: valid
+            [
+                ("", "bit", True),
+                ("@input", "nvarchar", False),
+                ("@pattern", "varchar", False),
+            ],
+        ]
+
+        result = keyword_search.discover_regex_function(cursor)
+        assert result == "util.fn_RegexMatch"
+
+
 # ---------- search_csv ----------
 
 class TestSearchCsv:
@@ -309,37 +469,38 @@ class TestSearchCsv:
     def test_basic_match(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,city\nAlice,New York\nBob,Boston\n")
-        results = keyword_search.search_csv(str(csv_file), ["Alice"])
+        results = keyword_search.search_csv(str(csv_file), [("Alice", False)])
         assert ("name", "Alice") in results
 
     def test_case_insensitive(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,city\nAlice,New York\n")
-        results = keyword_search.search_csv(str(csv_file), ["alice"])
+        results = keyword_search.search_csv(str(csv_file), [("alice", False)])
         assert ("name", "alice") in results
 
     def test_substring_match(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,city\nAlice,New York\n")
-        results = keyword_search.search_csv(str(csv_file), ["York"])
+        results = keyword_search.search_csv(str(csv_file), [("York", False)])
         assert ("city", "York") in results
 
     def test_no_match(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,city\nAlice,New York\n")
-        results = keyword_search.search_csv(str(csv_file), ["Chicago"])
+        results = keyword_search.search_csv(str(csv_file), [("Chicago", False)])
         assert results == []
 
     def test_empty_csv(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("")
-        results = keyword_search.search_csv(str(csv_file), ["test"])
+        results = keyword_search.search_csv(str(csv_file), [("test", False)])
         assert results == []
 
     def test_multiple_keywords_multiple_columns(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_text("name,city,state\nAlice,New York,NY\nBob,Boston,MA\n")
-        results = keyword_search.search_csv(str(csv_file), ["Alice", "Boston", "MA"])
+        classified = [("Alice", False), ("Boston", False), ("MA", False)]
+        results = keyword_search.search_csv(str(csv_file), classified)
         assert ("name", "Alice") in results
         assert ("city", "Boston") in results
         assert ("state", "MA") in results
@@ -347,8 +508,42 @@ class TestSearchCsv:
     def test_bom_csv(self, tmp_path):
         csv_file = tmp_path / "data.csv"
         csv_file.write_bytes(b"\xef\xbb\xbfname,city\nAlice,Boston\n")
-        results = keyword_search.search_csv(str(csv_file), ["Alice"])
+        results = keyword_search.search_csv(str(csv_file), [("Alice", False)])
         assert ("name", "Alice") in results
+
+    def test_regex_match(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,ssn\n1,123-45-6789\n2,N/A\n")
+        results = keyword_search.search_csv(
+            str(csv_file), [(r"\d{3}-\d{2}-\d{4}", True)]
+        )
+        assert ("ssn", r"\d{3}-\d{2}-\d{4}") in results
+        assert len(results) == 1
+
+    def test_regex_case_insensitive(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("code,value\nABC,xyz\n")
+        results = keyword_search.search_csv(
+            str(csv_file), [("[a-z]{3}", True)]
+        )
+        assert ("code", "[a-z]{3}") in results
+        assert ("value", "[a-z]{3}") in results
+
+    def test_regex_no_match(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,city\nAlice,Boston\n")
+        results = keyword_search.search_csv(
+            str(csv_file), [(r"\d{3}-\d{2}-\d{4}", True)]
+        )
+        assert results == []
+
+    def test_mixed_plain_and_regex(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,ssn\nAlice,123-45-6789\nBob,N/A\n")
+        classified = [("Alice", False), (r"\d{3}-\d{2}-\d{4}", True)]
+        results = keyword_search.search_csv(str(csv_file), classified)
+        assert ("name", "Alice") in results
+        assert ("ssn", r"\d{3}-\d{2}-\d{4}") in results
 
 
 # ---------- write_results ----------
@@ -392,8 +587,9 @@ class TestSearchDatabase:
             [],             # col2 no matches
         ]
 
+        classified = [("apple", False), ("banana", False)]
         results = keyword_search.search_database(
-            cursor, "MyTable", ["col1", "col2"], ["apple", "banana"]
+            cursor, "MyTable", ["col1", "col2"], classified
         )
 
         # Verify temp table creation
@@ -425,8 +621,8 @@ class TestSearchDatabase:
         cursor = MagicMock()
         cursor.fetchall.return_value = []
 
-        keywords = [f"keyword_{i}" for i in range(1200)]
-        keyword_search.search_database(cursor, "T", ["c1"], keywords)
+        classified = [(f"keyword_{i}", False) for i in range(1200)]
+        keyword_search.search_database(cursor, "T", ["c1"], classified)
 
         # Should have 3 batches: 500, 500, 200
         assert cursor.executemany.call_count == 3
@@ -435,14 +631,101 @@ class TestSearchDatabase:
         cursor = MagicMock()
         cursor.fetchall.side_effect = Exception("DB error")
 
+        classified = [("kw", False)]
         with pytest.raises(Exception, match="DB error"):
             keyword_search.search_database(
-                cursor, "T", ["c1"], ["kw"]
+                cursor, "T", ["c1"], classified
             )
 
         # Cleanup should still happen
         last_call = cursor.execute.call_args_list[-1][0][0]
         assert "DROP TABLE" in last_call
+
+    def test_regex_with_clr_function(self):
+        cursor = MagicMock()
+        # col1 LIKE query (plain) -> no match
+        # col1 CLR query (regex) -> match found
+        cursor.fetchall.side_effect = [
+            [],  # col1 plain LIKE: no matches
+        ]
+        cursor.fetchone.side_effect = [
+            (1,),  # col1 regex CLR: match
+        ]
+
+        classified = [("apple", False), (r"\d{3}", True)]
+        results = keyword_search.search_database(
+            cursor, "T", ["col1"], classified, regex_fn="dbo.RegexMatch"
+        )
+
+        assert ("col1", r"\d{3}") in results
+        # Verify CLR function was used in query
+        clr_calls = [
+            c for c in cursor.execute.call_args_list
+            if "RegexMatch" in str(c)
+        ]
+        assert len(clr_calls) == 1
+
+    def test_regex_client_side_fallback(self):
+        cursor = MagicMock()
+        # col1 LIKE query (plain) -> no match
+        # col1 distinct values for client-side regex
+        cursor.fetchall.side_effect = [
+            [],                          # col1 plain LIKE: no matches
+            [("123-45-6789",), ("N/A",)],  # col1 distinct values
+        ]
+
+        classified = [("apple", False), (r"\d{3}-\d{2}-\d{4}", True)]
+        results = keyword_search.search_database(
+            cursor, "T", ["col1"], classified, regex_fn=None
+        )
+
+        assert ("col1", r"\d{3}-\d{2}-\d{4}") in results
+
+    def test_regex_client_side_no_match(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [],                    # col1 plain LIKE: no matches
+            [("hello",), ("world",)],  # col1 distinct values
+        ]
+
+        classified = [("apple", False), (r"\d{3}", True)]
+        results = keyword_search.search_database(
+            cursor, "T", ["col1"], classified, regex_fn=None
+        )
+
+        assert results == []
+
+    def test_regex_only_no_temp_table(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("abc123",)],  # col1 distinct values
+        ]
+
+        classified = [(r"\d+", True)]
+        results = keyword_search.search_database(
+            cursor, "T", ["col1"], classified, regex_fn=None
+        )
+
+        assert ("col1", r"\d+") in results
+        # Verify no temp table was created (no #Keywords in any call)
+        for c in cursor.execute.call_args_list:
+            assert "#Keywords" not in str(c) or "DROP" in str(c)
+
+    def test_plain_only_no_distinct_query(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("apple",)],  # col1 matches
+        ]
+
+        classified = [("apple", False)]
+        results = keyword_search.search_database(
+            cursor, "T", ["col1"], classified, regex_fn=None
+        )
+
+        assert results == [("col1", "apple")]
+        # Verify no DISTINCT query was issued
+        for c in cursor.execute.call_args_list:
+            assert "DISTINCT CAST" not in str(c)
 
 
 # ---------- main ----------
@@ -494,6 +777,30 @@ class TestMain:
         result = keyword_search.main([])
         assert result != 0
 
+    def test_csv_mode_with_mixed_keywords(self, tmp_path):
+        kw_file = tmp_path / "keywords.txt"
+        kw_file.write_text("Alice\n\\d{3}-\\d{2}-\\d{4}\n")
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,ssn\nAlice,123-45-6789\nBob,N/A\n")
+
+        output = tmp_path / "results.csv"
+
+        result = keyword_search.main([
+            "--csv", str(csv_file),
+            "-k", str(kw_file),
+            "-o", str(output),
+        ])
+
+        assert result == 0
+        with open(output, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        matches = {(r[0], r[1]) for r in rows[1:]}
+        assert ("name", "Alice") in matches
+        assert ("ssn", r"\d{3}-\d{2}-\d{4}") in matches
+
     @patch("keyword_search.connect_to_database")
     def test_db_mode_integration(self, mock_connect, tmp_path):
         kw_file = tmp_path / "keywords.txt"
@@ -505,7 +812,7 @@ class TestMain:
         mock_connect.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
 
-        # get_table_columns
+        # get_table_columns, then LIKE queries per column
         mock_cursor.fetchall.side_effect = [
             [("col1",), ("col2",)],  # columns
             [("test_kw",)],           # col1 matches
